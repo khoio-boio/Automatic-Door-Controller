@@ -27,7 +27,8 @@ Below are the full requirements and setup instructions for each device.
 
 ### Optional
 - External 5V power supply for servo (recommended for heavy loads)
-- Breadboard
+- Arduino Prototype Shield v.5
+- Breadboards
 - Rubber bands / mounts for door mechanism
 - Inline resistor for button (if not using internal pull-ups)
 
@@ -40,11 +41,7 @@ The ESP32 acts as a simple physical trigger device. Pressing the button sends a 
 
 ### Wiring
 
-| Component | ESP32 Pin |
-|----------|-----------|
-| Button (one side) | GPIO 2 (D2) |
-| Button (other side) | GND |
-| USB power | USB port |
+<img src="assets/wiring_controller.png" width="450">
 
 **Note:**  
 The pin is configured using `INPUT_PULLUP`, so no external resistor is required.
@@ -68,18 +65,14 @@ It also supports IR remote inputs.
 
 ### Wiring
 
-| Component | Arduino R4 Pin |
-|-----------|----------------|
-| Servo Signal | D9 |
-| Servo VCC | 5V |
-| Servo GND | GND |
-| IR Receiver Signal | D2 |
-| IR Receiver VCC | 5V |
-| IR Receiver GND | GND |
-| USB Power | USB-C |
+<img src="assets/wiring_dev1.png" width="450">
+
+**Note:**
+The prototype shield plugs directly onto the R4.
+The mini breadboard then can stick directly to it.
 
 **Servo note:**  
-The R4 can power a small servo (SG90) from USB.  
+The R4 can power a small servo (SG90) from USB.
 For larger servos, use an external 5V supply with shared ground.
 
 ### Steps
