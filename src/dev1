@@ -86,8 +86,9 @@ void sendAck(const IPAddress& controllerIp,
                   ";scheduled=" + scheduled +
                   ";recurring=" + recurring +
                   ";next=" + nextTime;
-
-  udp.beginPacket(controllerIp, controllerPort);
+  const uint16_t UDP_PORT   = 4210;
+  IPAddress broadcastIp(192, 168, 86, 255);
+  udp.beginPacket(broadcastIp, UDP_PORT);
   udp.print(ackMsg);
   udp.endPacket();
 
@@ -138,18 +139,19 @@ void setup() {
 
 // =========== LOOPING CODE ===========
 void loop() {
-  // If any IR command detected, pick it up and output to Serial Monitor
   if (IrReceiver.decode()) {
     Serial.print("  Command: ");
     Serial.print(IrReceiver.decodedIRData.command);
-    // If understood to be precoded "1" button, then close the door
+
     if(IrReceiver.decodedIRData.command == 12){ // "1" button on IR Remote
       Serial.print(IrReceiver.decodedIRData.command);
       closeDoor();
     }
+
     IrReceiver.resume(); // ready for the next code
   }
 
+  // ======== WIFI / UDP COMMAND LISTENING ========
   // Reconnect Wi-Fi if needed
   if (WiFi.status() != WL_CONNECTED) {
     Serial.print("[");
@@ -157,7 +159,6 @@ void loop() {
     Serial.println("] WiFi lost, reconnecting...");
     connectWiFi();
   }
-  
   // Check for incoming UDP packets
   int packetSize = udp.parsePacket();
   if (packetSize > 0) {
@@ -190,7 +191,6 @@ void loop() {
       String recurring = extractField(msg, "recurring"); // "0" or "1"
       String nextTime  = extractField(msg, "next");      // "NONE" or timestamp
 
-      // Serial print for debugging - all of this will be 
       Serial.print("[");
       Serial.print(DEVICE_ID);
       Serial.print("] CMD parsed: origin=");
@@ -215,9 +215,19 @@ void loop() {
         Serial.print("] Command for me. action=");
         Serial.println(action);
 
+        bool recognized = false;
+
         // If "CLOSE_DOOR" then close the door
         if (action == "CLOSE_DOOR") {
           closeDoor();
+          recognized = true;
+        } else {
+          // Unknown/unsupported action
+          Serial.print("[");
+          Serial.print(DEVICE_ID);
+          Serial.print("] WARNING: Unknown action '");
+          Serial.print(action);
+          Serial.println("' – no movement performed.");
         }
 
         // Send ACK back to controller
@@ -226,11 +236,13 @@ void loop() {
           String safeScheduled = (scheduled.length() > 0) ? scheduled : "0";
           String safeRecurring = (recurring.length() > 0) ? recurring : "0";
           String safeNext      = (nextTime.length() > 0) ? nextTime : "NONE";
+          String status = recognized ? "OK" : "UNKNOWN_ACTION";
 
           sendAck(senderIp,
                   senderPort,
+                  safeOrigin,
                   cmdId,
-                  "OK",
+                  status,
                   safeScheduled,
                   safeRecurring,
                   safeNext);
