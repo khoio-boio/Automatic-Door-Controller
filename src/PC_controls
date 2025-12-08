@@ -1,19 +1,27 @@
+# =============================================================================
+# IMPORTS
+# =============================================================================
 import socket
 import threading
 import os
 import time
 import uuid
+import json
 from datetime import datetime, timedelta
 
-# ===== CONFIG =====
+# =============================================================================
+# CONFIG
+# =============================================================================
 BROADCAST_IP = "192.168.86.255"   # your LAN broadcast
 UDP_PORT = 4210                   # must match your devices
 ORIGIN = "PC"                     # this PC's origin ID
-# ========= END CONFIG =========
 
-# ======= GLOBALS =======
+# =============================================================================
+# GLOBAL STATE
+# =============================================================================
 scheduled_commands = {}  # schedule_id -> ScheduledCommand
 lock = threading.Lock()
+SCHEDULE_FILE = "schedules.json"
 
 # Create logs/session-YYYYMMDD-HHMMSS.log
 LOG_DIR = "logs"
@@ -29,15 +37,96 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 sock.bind(("", UDP_PORT))  # listen on all interfaces, port 4210
 
-
+# =============================================================================
+# UTILITY FUNCTIONS (LOGGING, PRINT HELPERS, PARSING)
+# =============================================================================
 def log_line(line: str):
     """Print to console and append to the current log file."""
     ts = datetime.now().isoformat(timespec="seconds")
     full = f"[{ts}] {line}"
-    print(full)
     log_file.write(full + "\n")
     log_file.flush()
 
+def print_commands():
+    print("\nCommands:")
+    print("  send <target> <action>")
+    print("      - send an immediate manual command")
+    print("      e.g. send dev1 CLOSE_DOOR")
+    print("")
+    print("  schedule-once <target> <action> <YYYY-MM-DDTHH:MM>")
+    print("      - schedule a single run at a specific local time")
+    print("      e.g. schedule-once dev1 CLOSE_DOOR 2025-12-04T21:30")
+    print("")
+    print("  schedule-every <target> <action> <seconds>")
+    print("      - schedule a recurring command every N seconds")
+    print("      e.g. schedule-every dev1 CLOSE_DOOR 60")
+    print("")
+    print("  list")
+    print("      - list scheduled commands")
+    print("")
+    print("  cancel <schedule_id>")
+    print("      - cancel a scheduled command by its ID prefix (first 8 characters)")
+    print("")
+    print("  help")
+    print("      - show commands and syntax")
+    print("")
+    print("  quit")
+    print("      - exit this program\n")
+
+def print_banner():
+    line = "─" * 75
+    print(line)
+    print("Auto Door Controller")
+    print("An automation project created by:")
+    print("  • Khoi Tran")
+    print("  • Cody Tran")
+    print("  • Benjamin Vanhuang\n")
+    print("For documentation & project updates:")
+    print("  https://github.com/khoio-boio/Automatic-Door-Controller\n")
+    print("Type 'help' to see available commands.\n")
+    print(line + "\n")
+
+def print_goodbye():
+    line = "─" * 70
+    print("\n" + line)
+    print("Thank you for using the Auto Door Controller.\n")
+    print("Project by:")
+    print("  • Khoi Tran")
+    print("  • Cody Tran")
+    print("  • Benjamin Vanhuang\n")
+    print("Schedules saved. Logs stored in the session logs folder.")
+    print("Have a great day!")
+    print(line + "\n")
+
+def parse_semicolon_message(text: str):
+    """
+    Parse messages like:
+      ACK;origin=PC;id=1;device=dev1;status=OK;scheduled=1;recurring=0;next=...
+
+    Returns:
+      kind: 'ACK', 'CMD', or first token before ';'
+      fields: dict of key->value
+    """
+    parts = text.split(";")
+    if not parts:
+        return None, {}
+
+    kind = parts[0].strip()  # e.g. 'ACK' or 'CMD'
+    fields = {}
+
+    for part in parts[1:]:
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key.strip()] = value.strip()
+
+    return kind, fields
+
+# =============================================================================
+# SCHEDULED COMMAND CLASS AND LOOP
+# =============================================================================
 class ScheduledCommand:
     def __init__(self, target, action, recurring, first_run, interval=None):
         self.schedule_id = str(uuid.uuid4())     # unique ID for CLI
@@ -55,81 +144,35 @@ class ScheduledCommand:
             return (f"{self.schedule_id[:8]}: target={self.target}, action={self.action}, "
                     f"one-shot at {self.next_run.isoformat()}")
 
-def listen_udp():
-    """Background thread: receive any UDP packets and log + interpret them."""
-    while True:
-        data, addr = sock.recvfrom(2048)
-        text = data.decode("utf-8", errors="replace").strip()
-        log_line(f"RECV from {addr}: {text}")
+    def to_dict(self):
+        """Convert to a JSON-serializable dict."""
+        return {
+            "schedule_id": self.schedule_id,
+            "target": self.target,
+            "action": self.action,
+            "recurring": self.recurring,
+            "next_run": self.next_run.isoformat(),
+            "interval_seconds": self.interval.total_seconds() if self.interval is not None else None,
+        }
 
-        kind, fields = parse_semicolon_message(text)
+    @classmethod
+    def from_dict(cls, data):
+        """Create a ScheduledCommand from a dict."""
+        next_run = datetime.fromisoformat(data["next_run"])
+        interval = None
+        if data.get("interval_seconds") is not None:
+            interval = timedelta(seconds=data["interval_seconds"])
 
-        if kind == "ACK":
-            origin    = fields.get("origin", "UNKNOWN")
-            cmd_id    = fields.get("id", "?")
-            device    = fields.get("device", "UNKNOWN")
-            status    = fields.get("status", "UNKNOWN")
-            scheduled = fields.get("scheduled", "0")
-            recurring = fields.get("recurring", "0")
-            next_time = fields.get("next", "NONE")
-
-            # Build a human-readable summary
-            sched_str = "scheduled" if scheduled == "1" else "manual"
-            recur_str = "recurring" if recurring == "1" else "one-shot"
-
-            pretty = (
-                f"ACK summary: device={device}, for {origin}#{cmd_id}, "
-                f"status={status}, {sched_str}, {recur_str}, next={next_time}"
-            )
-            print(pretty)
-
-        # Later, we can also add a 'elif kind == "CMD": ...' if you want to
-        # pretty-print controller-originated commands the PC hears.
-
-
-
-def send_command(target: str,
-                 action: str,
-                 scheduled_flag: bool,
-                 recurring_flag: bool,
-                 next_time_dt: datetime | None):
-    """Low-level send: used by both manual and scheduled commands."""
-    global pc_command_counter
-    pc_command_counter += 1
-    cmd_id = pc_command_counter
-
-    scheduled = "1" if scheduled_flag else "0"
-    recurring = "1" if recurring_flag else "0"
-    if next_time_dt is None:
-        next_time_str = "NONE"
-    else:
-        next_time_str = next_time_dt.isoformat(timespec="seconds")
-
-    msg = (
-        f"CMD;origin={ORIGIN}"
-        f";id={cmd_id}"
-        f";target={target}"
-        f";action={action}"
-        f";scheduled={scheduled}"
-        f";recurring={recurring}"
-        f";next={next_time_str}"
-    )
-
-    sock.sendto(msg.encode("utf-8"), (BROADCAST_IP, UDP_PORT))
-    log_line(f"SENT: {msg}")
-    return cmd_id
-
-
-def send_now(target: str, action: str):
-    """User-triggered, immediate command: manual, one-shot."""
-    send_command(
-        target=target,
-        action=action,
-        scheduled_flag=False,
-        recurring_flag=False,
-        next_time_dt=None,
-    )
-
+        sc = cls(
+            target=data["target"],
+            action=data["action"],
+            recurring=data["recurring"],
+            first_run=next_run,
+            interval=interval,
+        )
+        # Preserve the original schedule_id
+        sc.schedule_id = data["schedule_id"]
+        return sc
 
 def scheduler_loop():
     """Background scheduler: checks for due commands and sends them."""
@@ -176,34 +219,175 @@ def scheduler_loop():
 
         time.sleep(0.5)  # check twice a second
 
+# =============================================================================
+# PERSISTENCE (LOAD_SCHEDULES / SAVE_SCHEDULES)
+# =============================================================================
+def save_schedules():
+    """Write current scheduled_commands to SCHEDULE_FILE as JSON."""
+    with lock:
+        data = [sc.to_dict() for sc in scheduled_commands.values()]
 
-def parse_semicolon_message(text: str):
-    """
-    Parse messages like:
-      ACK;origin=PC;id=1;device=dev1;status=OK;scheduled=1;recurring=0;next=...
+    try:
+        with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        log_line(f"Saved {len(data)} schedules to {SCHEDULE_FILE}")
+    except Exception as e:
+        log_line(f"ERROR saving schedules to {SCHEDULE_FILE}: {e}")
 
-    Returns:
-      kind: 'ACK', 'CMD', or first token before ';'
-      fields: dict of key->value
-    """
-    parts = text.split(";")
-    if not parts:
-        return None, {}
 
-    kind = parts[0].strip()  # e.g. 'ACK' or 'CMD'
-    fields = {}
+def load_schedules():
+    """Load scheduled commands from SCHEDULE_FILE (if present)."""
+    try:
+        with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
+            raw_list = json.load(f)
+    except FileNotFoundError:
+        log_line(f"No existing schedule file {SCHEDULE_FILE}, starting fresh.")
+        return
+    except Exception as e:
+        log_line(f"ERROR loading {SCHEDULE_FILE}: {e}")
+        return
 
-    for part in parts[1:]:
-        part = part.strip()
-        if not part:
-            continue
-        if "=" in part:
-            key, value = part.split("=", 1)
-            fields[key.strip()] = value.strip()
+    now = datetime.now()
+    loaded_count = 0
+    skipped_past = 0
 
-    return kind, fields
+    with lock:
+        scheduled_commands.clear()
+        for item in raw_list:
+            sc = ScheduledCommand.from_dict(item)
 
-# ======= MAIN =======
+            # One-shot job in the past -> drop it
+            if not sc.recurring and sc.next_run <= now:
+                skipped_past += 1
+                continue
+
+            # Recurring job in the past -> roll forward to the next future time
+            if sc.recurring and sc.interval is not None and sc.next_run <= now:
+                delta = now - sc.next_run
+                # Number of intervals to move forward
+                intervals = int(delta.total_seconds() // sc.interval.total_seconds()) + 1
+                sc.next_run = sc.next_run + sc.interval * intervals
+
+            scheduled_commands[sc.schedule_id] = sc
+            loaded_count += 1
+
+    log_line(
+        f"Loaded {loaded_count} schedules from {SCHEDULE_FILE} "
+        f"(skipped {skipped_past} past one-shot jobs)."
+    )
+
+# =============================================================================
+# UDP LISTENER THREAD
+# =============================================================================
+def listen_udp():
+    """Background thread: receive any UDP packets and log + interpret them."""
+    while True:
+        data, addr = sock.recvfrom(2048)
+        text = data.decode("utf-8", errors="replace").strip()
+        log_line(f"RECV from {addr}: {text}")
+
+        kind, fields = parse_semicolon_message(text)
+
+        if kind == "ACK":
+            origin    = fields.get("origin", "UNKNOWN")
+            cmd_id    = fields.get("id", "?")
+            device    = fields.get("device", "UNKNOWN")
+            status    = fields.get("status", "UNKNOWN")
+            scheduled = fields.get("scheduled", "0")
+            recurring = fields.get("recurring", "0")
+            next_time = fields.get("next", "NONE")
+
+            # Build a human-readable summary
+            sched_str = "scheduled" if scheduled == "1" else "manual"
+            recur_str = "recurring" if recurring == "1" else "one-shot"
+
+            pretty = (
+                f"[SYS] ACK summary: device={device}, for {origin}#{cmd_id}, "
+                f"status={status}, {sched_str}, {recur_str}, next={next_time}"
+            )
+            print(pretty)
+
+        elif kind == "CMD":
+            origin    = fields.get("origin", "UNKNOWN")
+            cmd_id    = fields.get("id", "?")
+            target    = fields.get("target", "UNKNOWN")
+            action    = fields.get("action", "UNKNOWN")
+            scheduled = fields.get("scheduled", "0")
+            recurring = fields.get("recurring", "0")
+            next_time = fields.get("next", "NONE")
+
+            # 1) Ignore our own commands (PC hears its own broadcast)
+            if origin == ORIGIN:
+                # We already know we sent it; it’s in the log file via log_line("SENT: ...")
+                continue
+
+            # 2) Pretty-print CMD summary for commands from others (e.g. controller)
+            sched_str = "scheduled" if scheduled == "1" else "manual"
+            recur_str = "recurring" if recurring == "1" else "one-shot"
+
+            pretty = (
+                f"[SYS] CMD heard: from {origin}#{cmd_id} -> target={target}, "
+                f"action={action}, {sched_str}, {recur_str}, next={next_time}"
+            )
+            print(pretty)
+
+
+# =============================================================================
+# UDP SEND LOGIC (send_command, send_now wrappers)
+# =============================================================================
+def send_command(target: str,
+                 action: str,
+                 scheduled_flag: bool,
+                 recurring_flag: bool,
+                 next_time_dt: datetime | None):
+    """Low-level send: used by both manual and scheduled commands."""
+    global pc_command_counter
+    pc_command_counter += 1
+    cmd_id = pc_command_counter
+
+    scheduled = "1" if scheduled_flag else "0"
+    recurring = "1" if recurring_flag else "0"
+    if next_time_dt is None:
+        next_time_str = "NONE"
+    else:
+        next_time_str = next_time_dt.isoformat(timespec="seconds")
+
+    msg = (
+        f"CMD;origin={ORIGIN}"
+        f";id={cmd_id}"
+        f";target={target}"
+        f";action={action}"
+        f";scheduled={scheduled}"
+        f";recurring={recurring}"
+        f";next={next_time_str}"
+    )
+
+    sock.sendto(msg.encode("utf-8"), (BROADCAST_IP, UDP_PORT))
+    log_line(f"SENT: {msg}")
+
+    # Short human summary on console
+    sched_str = "scheduled" if scheduled_flag else "manual"
+    recur_str = "recurring" if recurring_flag else "one-shot"
+    print(
+        f"[SYS] SENT CMD: {ORIGIN}#{cmd_id} -> target={target}, "
+        f"action={action}, {sched_str}, {recur_str}, next={next_time_str}"
+    )
+
+    return cmd_id
+    
+def send_now(target: str, action: str):
+    """User-triggered, immediate command: manual, one-shot."""
+    send_command(
+        target=target,
+        action=action,
+        scheduled_flag=False,
+        recurring_flag=False,
+        next_time_dt=None,
+    )
+
+# =============================================================================
+# MAIN STARTUP AND LOOP
+# =============================================================================
 def main():
     log_line("=== PC CLI started ===")
     log_line(f"Logging to file: {log_path}")
@@ -216,15 +400,18 @@ def main():
     sched_thread = threading.Thread(target=scheduler_loop, daemon=True)
     sched_thread.start()
 
+    # Load schedules from disk (if any)
+    load_schedules()
 
-    print("\nCommands:")
-    print("  send <target> <action>   - send an immediate command")
-    print("      e.g. send dev1 CLOSE_DOOR")
-    print("  quit                     - exit this program\n")
+    # Print welcome / load in message
+    print_banner()
 
+# =============================================================================
+# USER COMMAND PROCESSING
+# =============================================================================
     while True:
         try:
-            line = input("> ").strip()
+            line = input().strip()
         except EOFError:
             break
 
@@ -236,17 +423,96 @@ def main():
 
         if cmd == "send" and len(parts) >= 3:
             _, target, action = parts[:3]
-            send_cmd(target, action)
+            send_now(target, action)
+
+        elif cmd == "schedule-once" and len(parts) >= 4:
+            _, target, action, timestr = parts[:4]
+            try:
+                when = datetime.fromisoformat(timestr)
+            except ValueError:
+                print("[SYS] Invalid datetime format. Use YYYY-MM-DDTHH:MM, e.g. 2025-12-04T21:30")
+                continue
+
+            sc = ScheduledCommand(
+                target=target,
+                action=action,
+                recurring=False,
+                first_run=when,
+                interval=None,
+            )
+            with lock:
+                scheduled_commands[sc.schedule_id] = sc
+
+            log_line(f"Scheduled once: {sc.schedule_id} at {when.isoformat()} "
+                     f"for target={target}, action={action}")
+            print(f"[SYS] Scheduled once with ID: {sc.schedule_id}")
+
+        elif cmd == "schedule-every" and len(parts) >= 4:
+            _, target, action, sec_str = parts[:4]
+            try:
+                seconds = int(sec_str)
+            except ValueError:
+                print("[SYS] Invalid seconds value. Use an integer, e.g. 60")
+                continue
+
+            interval = timedelta(seconds=seconds)
+            first_run = datetime.now() + interval
+            sc = ScheduledCommand(
+                target=target,
+                action=action,
+                recurring=True,
+                first_run=first_run,
+                interval=interval,
+            )
+            with lock:
+                scheduled_commands[sc.schedule_id] = sc
+
+            log_line(f"Scheduled recurring: {sc.schedule_id} every {interval} "
+                     f"for target={target}, action={action}")
+            print(f"[SYS] Scheduled recurring with ID: {sc.schedule_id}")
+
+        elif cmd == "list":
+            with lock:
+                if not scheduled_commands:
+                    print("[SYS] No scheduled commands.")
+                else:
+                    print("[SYS] Scheduled commands:")
+                    for sc in scheduled_commands.values():
+                        print("  ", str(sc))
+
+        elif cmd == "cancel" and len(parts) >= 2:
+            prefix = parts[1]
+            cancelled = False
+            with lock:
+                # allow matching by prefix (first 8 chars, etc.)
+                to_delete = None
+                for sid in scheduled_commands.keys():
+                    if sid.startswith(prefix):
+                        to_delete = sid
+                        break
+                if to_delete is not None:
+                    scheduled_commands.pop(to_delete, None)
+                    cancelled = True
+
+            if cancelled:
+                log_line(f"Cancelled schedule {prefix}")
+                print(f"[SYS] Cancelled schedule starting with ID: {prefix}")
+            else:
+                print(f"[SYS] No schedule found with ID prefix: {prefix}")
 
         elif cmd == "quit":
             break
 
-        else:
-            print("Unknown command.")
-            print("Try: send dev1 CLOSE_DOOR   or   quit")
+        elif cmd == "help":
+            print_commands()
 
+        else:
+            print("[SYS] Unknown command. Try \"help\" to see the full command list.")
+
+    # Before exiting, persist current schedules to disk
+    save_schedules()
     log_line("=== PC CLI exiting ===")
-# ======= END MAIN =======
+    print_goodbye()
 
 if __name__ == "__main__":
     main()
